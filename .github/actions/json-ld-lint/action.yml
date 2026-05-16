@@ -1,0 +1,138 @@
+name: "JSON-LD Lint"
+description: >
+  Walks built HTML, extracts <script type="application/ld+json"> blocks,
+  validates JSON syntax, and verifies each block expands cleanly against the
+  schema.org context using the `jsonld` processor (npm: jsonld v9, last
+  published Nov 2025 — chosen over structured-data-testing-tool which was
+  abandoned in May 2022). Errors point to the specific page + @type that failed.
+
+inputs:
+  build-dir:
+    description: >
+      Directory to walk for HTML files. Defaults to the Next.js output dir.
+      For static export, pass `out`; for server build, pass `.next`.
+    required: false
+    default: ".next"
+  strict:
+    description: >
+      If true (default), fail the step on any JSON-LD error. Set to false to
+      emit warnings without failing.
+    required: false
+    default: "true"
+  schema-org-version:
+    description: >
+      Schema.org version to validate against. `latest` resolves to the current
+      schema.org context served at https://schema.org/. Pass a specific version
+      string (e.g. `22.0`) to pin validation to that release. Currently
+      informational — jsonld resolves the @context URL at runtime, so the
+      effective version is whatever schema.org serves.
+    required: false
+    default: "latest"
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+
+    - name: Install jsonld processor
+      shell: bash
+      run: npm install --no-save jsonld@^9
+
+    - name: Write JSON-LD lint script
+      shell: bash
+      run: |
+        cat > /tmp/jsonld-lint.mjs << 'SCRIPT'
+        import { readFileSync, readdirSync, statSync } from 'fs';
+        import { join, relative } from 'path';
+        import jsonld from './node_modules/jsonld/lib/jsonld.js';
+
+        const buildDir = process.env.BUILD_DIR || '.next';
+        const strict = process.env.STRICT !== 'false';
+
+        /** Recursively collect .html files under a directory. */
+        function walk(dir) {
+          const results = [];
+          for (const entry of readdirSync(dir)) {
+            const full = join(dir, entry);
+            const stat = statSync(full);
+            if (stat.isDirectory()) {
+              results.push(...walk(full));
+            } else if (entry.endsWith('.html')) {
+              results.push(full);
+            }
+          }
+          return results;
+        }
+
+        /** Extract raw JSON-LD strings from an HTML string. */
+        function extractBlocks(html) {
+          const blocks = [];
+          const re = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+          let m;
+          while ((m = re.exec(html)) !== null) {
+            blocks.push(m[1].trim());
+          }
+          return blocks;
+        }
+
+        let totalFiles = 0;
+        let totalBlocks = 0;
+        let errors = 0;
+
+        const files = walk(buildDir);
+
+        for (const file of files) {
+          const rel = relative(process.cwd(), file);
+          const html = readFileSync(file, 'utf8');
+          const blocks = extractBlocks(html);
+          if (blocks.length === 0) continue;
+          totalFiles++;
+
+          for (let i = 0; i < blocks.length; i++) {
+            totalBlocks++;
+            const raw = blocks[i];
+            let parsed;
+
+            // 1. JSON syntax check
+            try {
+              parsed = JSON.parse(raw);
+            } catch (err) {
+              console.error(`[JSON-LD LINT] ${rel} block[${i}]: JSON parse error — ${err.message}`);
+              errors++;
+              continue;
+            }
+
+            // 2. schema.org context expansion via jsonld processor
+            const type = parsed['@type'] || '(no @type)';
+            const context = parsed['@context'];
+
+            if (!context) {
+              console.warn(`[JSON-LD LINT] ${rel} block[${i}] @type=${type}: missing @context — skipping expansion`);
+              continue;
+            }
+
+            try {
+              await jsonld.expand(parsed, { documentLoader: jsonld.documentLoaders.node() });
+            } catch (err) {
+              console.error(`[JSON-LD LINT] ${rel} block[${i}] @type=${type}: expansion failed — ${err.message}`);
+              errors++;
+            }
+          }
+        }
+
+        console.log(`\nJSON-LD lint complete: ${totalFiles} files with LD+JSON, ${totalBlocks} blocks checked, ${errors} error(s).`);
+
+        if (errors > 0 && strict) {
+          process.exit(1);
+        }
+        SCRIPT
+
+    - name: Run JSON-LD lint
+      shell: bash
+      env:
+        BUILD_DIR: ${{ inputs.build-dir }}
+        STRICT: ${{ inputs.strict }}
+      run: node /tmp/jsonld-lint.mjs

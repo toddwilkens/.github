@@ -1,0 +1,121 @@
+name: "Lychee Link Checker"
+description: >
+  Composite action wrapping lycheeverse/lychee-action@v2. Fails the step on
+  any internal 4xx/5xx; posts external link failures as a non-blocking PR
+  comment. Designed for Next.js built output but works with any static HTML dir.
+
+inputs:
+  scan-target:
+    description: >
+      Glob or path to scan. Defaults to the Next.js build output directory.
+      Pass a space-separated list of globs for multiple targets.
+    required: false
+    default: ".next/server/**/*.html .next/static/**/*.html out/**/*.html"
+  skip-urls:
+    description: >
+      Newline-separated list of URL patterns to skip (regex supported).
+      Optional. These are appended to lychee's built-in exclusion list.
+    required: false
+    default: ""
+  fail-on-internal-404:
+    description: >
+      If true (default), fail the CI step when any internal link returns 4xx or
+      5xx. Set to false to collect errors without failing.
+    required: false
+    default: "true"
+  external-link-comment:
+    description: >
+      If true (default), post a PR comment listing external link warnings.
+      Non-blocking — step succeeds even when external links are broken.
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Build lychee exclude list
+      id: excludes
+      shell: bash
+      run: |
+        # Start with caller-supplied skip-urls; convert newlines to pipe-separated
+        # regex alternation that lychee's --exclude flag accepts.
+        SKIP="${{ inputs.skip-urls }}"
+        if [[ -n "$SKIP" ]]; then
+          # Strip blank lines, join with |
+          PATTERNS=$(printf '%s' "$SKIP" | grep -v '^$' | paste -sd '|' -)
+          echo "exclude=--exclude '$PATTERNS'" >> "$GITHUB_OUTPUT"
+        else
+          echo "exclude=" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Run lychee (internal links — blocking)
+      id: lychee-internal
+      uses: lycheeverse/lychee-action@v2
+      with:
+        # Only check internal (same-site) links in this step.
+        # lychee treats relative and root-relative hrefs as internal.
+        args: >-
+          --no-progress
+          --include-verbatim
+          --scheme file
+          --base .
+          ${{ steps.excludes.outputs.exclude }}
+          ${{ inputs.scan-target }}
+        fail: ${{ inputs.fail-on-internal-404 }}
+        output: lychee-internal.json
+        format: json
+
+    - name: Run lychee (external links — non-blocking)
+      id: lychee-external
+      if: inputs.external-link-comment == 'true'
+      uses: lycheeverse/lychee-action@v2
+      with:
+        args: >-
+          --no-progress
+          --include-verbatim
+          --scheme https http
+          ${{ steps.excludes.outputs.exclude }}
+          ${{ inputs.scan-target }}
+        fail: "false"
+        output: lychee-external.json
+        format: json
+
+    - name: Post external link warnings as PR comment
+      if: >
+        inputs.external-link-comment == 'true' &&
+        github.event_name == 'pull_request' &&
+        hashFiles('lychee-external.json') != ''
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          let report;
+          try {
+            report = JSON.parse(fs.readFileSync('lychee-external.json', 'utf8'));
+          } catch {
+            core.info('No external link report to post.');
+            return;
+          }
+
+          const failures = Object.entries(report.fail_map || {});
+          if (failures.length === 0) {
+            core.info('No external link failures — skipping PR comment.');
+            return;
+          }
+
+          const lines = ['## External link warnings (non-blocking)', ''];
+          for (const [url, sources] of failures) {
+            lines.push(`- **${url}**`);
+            for (const src of sources) {
+              lines.push(`  - found in: \`${src}\``);
+            }
+          }
+          lines.push('');
+          lines.push('> These are warnings only. Fix before launch but they do not block merge.');
+
+          await github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+            body: lines.join('\n'),
+          });
