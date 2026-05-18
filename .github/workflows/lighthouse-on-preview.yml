@@ -1,9 +1,9 @@
 name: Lighthouse on Preview
 
-# Reusable workflow. Consumers wire it up with an `on: deployment_status`
-# trigger in their own workflow that calls this one.
+# Reusable workflow. Runs Lighthouse CI against one or more URLs and enforces
+# configurable SEO, accessibility, LCP, and CLS budgets.
 #
-# Example consumer usage:
+# Example consumer usage (single page):
 #
 #   on:
 #     deployment_status:
@@ -11,34 +11,82 @@ name: Lighthouse on Preview
 #   jobs:
 #     lighthouse:
 #       if: github.event.deployment_status.state == 'success'
-#       uses: toddwilkens/.github/.github/workflows/lighthouse-on-preview.yml@v1
+#       uses: toddwilkens/.github/.github/workflows/lighthouse-on-preview.yml@v1.3
 #       with:
-#         preview-url: ${{ github.event.deployment_status.target_url }}
-#         seo-threshold: 0.95
+#         urls: ${{ github.event.deployment_status.target_url }}
 #       secrets:
 #         vercel-bypass-secret: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+#
+# Multi-page example:
+#
+#       with:
+#         urls: |
+#           ${{ github.event.deployment_status.target_url }}/
+#           ${{ github.event.deployment_status.target_url }}/about
+#           ${{ github.event.deployment_status.target_url }}/pricing
+#         seo-threshold: 0.95
+#         accessibility-threshold: 0.9
+#         lcp-threshold-ms: 2500
+#         cls-threshold: 0.1
+#         number-of-runs: 3
 
 on:
   workflow_call:
     inputs:
-      preview-url:
-        description: "The Vercel preview deployment URL to audit."
+      urls:
+        description: >
+          One or more URLs to audit, newline-separated. Each URL is audited
+          independently and budgets apply per-URL.
         required: true
         type: string
       seo-threshold:
-        description: >
-          Minimum Lighthouse SEO score (0.0–1.0) that must pass. Defaults to
-          0.95 (95). The job fails if the score falls below this value.
+        description: "Minimum SEO score (0.0-1.0). Default 0.95."
         required: false
         type: number
         default: 0.95
+      accessibility-threshold:
+        description: "Minimum accessibility score (0.0-1.0). Default 0.9."
+        required: false
+        type: number
+        default: 0.9
+      lcp-threshold-ms:
+        description: "Maximum Largest Contentful Paint, milliseconds. Default 2500."
+        required: false
+        type: number
+        default: 2500
+      cls-threshold:
+        description: "Maximum Cumulative Layout Shift. Default 0.1."
+        required: false
+        type: number
+        default: 0.1
+      performance-threshold:
+        description: >
+          Optional minimum performance category score (0.0-1.0). Disabled by
+          default (0) - set > 0 to enforce.
+        required: false
+        type: number
+        default: 0
+      number-of-runs:
+        description: "Lighthouse runs per URL (median used). Default 3."
+        required: false
+        type: number
+        default: 3
+      upload-to-public-storage:
+        description: >
+          If true, upload reports to Lighthouse's temporary-public-storage and
+          surface the public URL. SECURITY: the report includes Lighthouse
+          config (potentially extraHeaders containing the bypass secret).
+          Leave false when using vercel-bypass-secret to avoid leaking it; the
+          workflow uploads .lighthouseci/ as a workflow artifact regardless.
+        required: false
+        type: boolean
+        default: false
     secrets:
       vercel-bypass-secret:
         description: >
-          Vercel Automation Bypass Secret. Passed as the
-          `x-vercel-protection-bypass` header so Lighthouse can reach password-
-          protected preview deployments. Required if preview protection is
-          enabled on the Vercel project.
+          Vercel Automation Bypass Secret. Sent as the
+          `x-vercel-protection-bypass` header so Lighthouse can reach
+          SSO-protected preview deployments.
         required: false
 
 jobs:
@@ -46,60 +94,122 @@ jobs:
     name: Lighthouse audit
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout (for lighthouserc config if present)
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Write Lighthouse CI config
         shell: bash
+        env:
+          URLS_RAW: ${{ inputs.urls }}
+          BYPASS_SECRET: ${{ secrets.vercel-bypass-secret }}
+          SEO_THRESHOLD: ${{ inputs.seo-threshold }}
+          A11Y_THRESHOLD: ${{ inputs.accessibility-threshold }}
+          LCP_THRESHOLD_MS: ${{ inputs.lcp-threshold-ms }}
+          CLS_THRESHOLD: ${{ inputs.cls-threshold }}
+          PERF_THRESHOLD: ${{ inputs.performance-threshold }}
+          NUMBER_OF_RUNS: ${{ inputs.number-of-runs }}
         run: |
-          cat > lighthouserc.json << EOF
-          {
-            "ci": {
-              "collect": {
-                "url": ["${{ inputs.preview-url }}"],
-                "numberOfRuns": 1,
-                "settings": {
-                  "extraHeaders": {
-                    "x-vercel-protection-bypass": "${{ secrets.vercel-bypass-secret }}"
-                  }
-                }
-              },
-              "assert": {
-                "assertions": {
-                  "categories:seo": ["error", {"minScore": ${{ inputs.seo-threshold }}}]
-                }
-              },
-              "upload": {
-                "target": "temporary-public-storage"
-              }
-            }
+          python3 << 'PY'
+          import json, os
+          urls = [u.strip() for u in os.environ["URLS_RAW"].splitlines() if u.strip()]
+          if not urls:
+              raise SystemExit("lighthouse-on-preview: `urls` input is empty")
+          settings = {}
+          bypass = os.environ.get("BYPASS_SECRET", "")
+          if bypass:
+              settings["extraHeaders"] = {"x-vercel-protection-bypass": bypass}
+          assertions = {
+              "categories:seo": ["error", {"minScore": float(os.environ["SEO_THRESHOLD"])}],
+              "categories:accessibility": ["error", {"minScore": float(os.environ["A11Y_THRESHOLD"])}],
+              "largest-contentful-paint": ["error", {"maxNumericValue": float(os.environ["LCP_THRESHOLD_MS"])}],
+              "cumulative-layout-shift": ["error", {"maxNumericValue": float(os.environ["CLS_THRESHOLD"])}],
           }
-          EOF
+          perf = float(os.environ.get("PERF_THRESHOLD", "0"))
+          if perf > 0:
+              assertions["categories:performance"] = ["error", {"minScore": perf}]
+          config = {
+              "ci": {
+                  "collect": {
+                      "url": urls,
+                      "numberOfRuns": int(float(os.environ["NUMBER_OF_RUNS"])),
+                      "settings": settings,
+                  },
+                  "assert": {"assertions": assertions},
+              }
+          }
+          with open("lighthouserc.json", "w") as f:
+              json.dump(config, f, indent=2)
+          dbg = json.loads(json.dumps(config))
+          eh = dbg["ci"]["collect"].get("settings", {}).get("extraHeaders")
+          if eh:
+              dbg["ci"]["collect"]["settings"]["extraHeaders"] = {k: "***REDACTED***" for k in eh}
+          print("Generated lighthouserc.json (secrets redacted):")
+          print(json.dumps(dbg, indent=2))
+          PY
 
       - name: Run Lighthouse CI
         uses: treosh/lighthouse-ci-action@v12
         with:
           configPath: lighthouserc.json
           uploadArtifacts: true
-          temporaryPublicStorage: true
+          temporaryPublicStorage: ${{ inputs.upload-to-public-storage }}
         env:
           LHCI_GITHUB_APP_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Report SEO score
+      - name: Report scores in step summary
         if: always()
         shell: bash
+        env:
+          SEO_THRESHOLD: ${{ inputs.seo-threshold }}
+          A11Y_THRESHOLD: ${{ inputs.accessibility-threshold }}
+          LCP_THRESHOLD_MS: ${{ inputs.lcp-threshold-ms }}
+          CLS_THRESHOLD: ${{ inputs.cls-threshold }}
         run: |
-          # Surface score in the step summary for easy dashboard reading.
-          REPORT=$(find .lighthouseci -name '*.json' | head -1)
-          if [[ -f "$REPORT" ]]; then
-            SEO=$(python3 -c "
-          import json, sys
-          d = json.load(open('$REPORT'))
-          cats = d.get('categories', {})
-          seo = cats.get('seo', {}).get('score', 'N/A')
-          print(seo)
-          " 2>/dev/null || echo "N/A")
-            echo "### Lighthouse SEO score: ${SEO}" >> "$GITHUB_STEP_SUMMARY"
-            echo "Threshold: ${{ inputs.seo-threshold }}" >> "$GITHUB_STEP_SUMMARY"
-            echo "Preview URL: ${{ inputs.preview-url }}" >> "$GITHUB_STEP_SUMMARY"
-          fi
+          python3 << 'PY'
+          import json, os, pathlib
+          summary_path = os.environ["GITHUB_STEP_SUMMARY"]
+          manifest_path = pathlib.Path(".lighthouseci/manifest.json")
+          def write(line):
+              with open(summary_path, "a") as f:
+                  f.write(line + "\n")
+          if not manifest_path.exists():
+              write("### Lighthouse: no manifest.json produced (run failed before collection)")
+              raise SystemExit(0)
+          try:
+              manifest = json.loads(manifest_path.read_text())
+          except json.JSONDecodeError as e:
+              write(f"### Lighthouse: manifest.json is not valid JSON: {e}")
+              raise SystemExit(0)
+          if not isinstance(manifest, list):
+              write(f"### Lighthouse: unexpected manifest shape ({type(manifest).__name__})")
+              raise SystemExit(0)
+          by_url = {}
+          for entry in manifest:
+              if entry.get("isRepresentativeRun"):
+                  by_url[entry["url"]] = entry.get("summary", {})
+          for entry in manifest:
+              by_url.setdefault(entry["url"], entry.get("summary", {}))
+          write("### Lighthouse audit results")
+          write("")
+          write(f"Thresholds: SEO >= {os.environ['SEO_THRESHOLD']}, "
+                f"A11y >= {os.environ['A11Y_THRESHOLD']}, "
+                f"LCP <= {os.environ['LCP_THRESHOLD_MS']}ms, "
+                f"CLS <= {os.environ['CLS_THRESHOLD']}")
+          write("")
+          write("| URL | Perf | SEO | A11y | Best practices |")
+          write("|-----|------|-----|------|----------------|")
+          for url, summary in by_url.items():
+              perf = summary.get("performance", "-")
+              seo = summary.get("seo", "-")
+              a11y = summary.get("accessibility", "-")
+              bp = summary.get("best-practices", "-")
+              write(f"| {url} | {perf} | {seo} | {a11y} | {bp} |")
+          PY
+
+      - name: Upload Lighthouse reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lighthouse-reports
+          path: .lighthouseci/
+          retention-days: 14
+          if-no-files-found: ignore

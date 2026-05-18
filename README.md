@@ -34,7 +34,7 @@ Composite action that walks built HTML, extracts `<script type="application/ld+j
 
 ### `.github/workflows/lighthouse-on-preview.yml`
 
-Reusable workflow (`workflow_call`) that runs Lighthouse CI against a Vercel preview URL and enforces a configurable SEO score threshold (default 0.95).
+Reusable workflow (`workflow_call`) that runs Lighthouse CI against one or more Vercel preview URLs and enforces configurable SEO, accessibility, LCP, and CLS budgets per URL.
 
 ```yaml
 # In your repo's .github/workflows/lighthouse.yml:
@@ -44,13 +44,26 @@ on:
 jobs:
   lighthouse:
     if: github.event.deployment_status.state == 'success'
-    uses: toddwilkens/.github/.github/workflows/lighthouse-on-preview.yml@v1
+    uses: toddwilkens/.github/.github/workflows/lighthouse-on-preview.yml@v1.3
     with:
-      preview-url: ${{ github.event.deployment_status.target_url }}
-      seo-threshold: 0.95
+      urls: |
+        ${{ github.event.deployment_status.target_url }}/
+        ${{ github.event.deployment_status.target_url }}/about
+        ${{ github.event.deployment_status.target_url }}/pricing
+      seo-threshold: 0.95           # optional, default 0.95
+      accessibility-threshold: 0.9  # optional, default 0.9
+      lcp-threshold-ms: 2500        # optional, default 2500
+      cls-threshold: 0.1            # optional, default 0.1
+      number-of-runs: 3             # optional, default 3
     secrets:
       vercel-bypass-secret: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
 ```
+
+**Inputs:** `urls` (newline-separated, required), `seo-threshold`, `accessibility-threshold`, `lcp-threshold-ms`, `cls-threshold`, `performance-threshold` (optional, off by default), `number-of-runs`, `upload-to-public-storage` (default false — see below).
+
+**Reports:** Full `.lighthouseci/` directory is uploaded as a workflow artifact (`lighthouse-reports`, 14-day retention) regardless of `upload-to-public-storage`.
+
+**Security note:** `upload-to-public-storage` defaults to `false` because the Lighthouse JSON report embeds `configSettings.extraHeaders`, which includes the `vercel-bypass-secret`. Enabling public upload while passing a bypass secret would leak it to a world-readable URL. Keep this off unless you're auditing a non-SSO-protected site.
 
 ---
 
