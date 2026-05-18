@@ -2,19 +2,64 @@ name: "Lychee Link Checker"
 description: >
   Composite action wrapping lycheeverse/lychee-action@v2. Fails the step on
   any internal 4xx/5xx; posts external link failures as a non-blocking PR
-  comment. Designed for Next.js built output but works with any static HTML dir.
+  comment. Designed for static HTML built output from common frameworks
+  (Next.js App Router / Pages Router, static export, Astro, Hugo, etc.).
+
+  Framework-specific configuration is exposed as inputs (`root-dir`,
+  `fallback-extensions`, `base-url`, `extra-args`) — see input descriptions
+  for the Next.js App Router pattern.
 
 inputs:
   scan-target:
     description: >
-      Glob or path to scan. Defaults to the Next.js build output directory.
-      Pass a space-separated list of globs for multiple targets.
+      Glob or path to scan for HTML files. Pass a space-separated list of
+      globs for multiple targets. Default targets Next.js prerendered HTML;
+      override for static-export (`out/**/*.html`) or other frameworks.
     required: false
-    default: ".next/server/**/*.html .next/static/**/*.html out/**/*.html"
+    default: ".next/server/**/*.html"
+  root-dir:
+    description: >
+      Absolute path that root-relative links (`/about`, `/pricing`) should
+      resolve against. Required if HTML files contain root-relative hrefs
+      and `--scheme file` is used (the default for internal-link checking).
+
+      Next.js App Router pattern:
+        root-dir: ${{ github.workspace }}/.next/server/app
+      Next.js Pages Router pattern:
+        root-dir: ${{ github.workspace }}/.next/server/pages
+      Static-export pattern:
+        root-dir: ${{ github.workspace }}/out
+    required: false
+    default: ""
+  fallback-extensions:
+    description: >
+      Comma-separated extensions lychee will append when a file:// URL
+      doesn't exist. Lets `/about` resolve to `about.html`. Default
+      `html,htm` covers most static-site frameworks.
+    required: false
+    default: "html,htm"
+  base-url:
+    description: >
+      Base URL or absolute path for resolving plain relative links (no
+      leading slash). Optional — most static-site builds don't need it.
+      Must be a full URL with scheme or an absolute filesystem path.
+    required: false
+    default: ""
   skip-urls:
     description: >
       Newline-separated list of URL patterns to skip (regex supported).
       Optional. These are appended to lychee's built-in exclusion list.
+
+      Common Next.js excludes:
+        ^file://.*/_next/.*
+        \.(svg|png|jpg|jpeg|webp|gif|ico|woff2?)$
+    required: false
+    default: ""
+  extra-args:
+    description: >
+      Escape hatch for additional lychee flags not exposed as inputs.
+      Appended verbatim to both the internal and external lychee
+      invocations.
     required: false
     default: ""
   fail-on-internal-404:
@@ -33,33 +78,57 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Build lychee exclude list
-      id: excludes
+    - name: Compose lychee args
+      id: lychee-args
       shell: bash
+      env:
+        SKIP_URLS: ${{ inputs.skip-urls }}
+        ROOT_DIR_IN: ${{ inputs.root-dir }}
+        BASE_URL_IN: ${{ inputs.base-url }}
+        FALLBACK_EXT: ${{ inputs.fallback-extensions }}
+        EXTRA_ARGS: ${{ inputs.extra-args }}
       run: |
-        # Start with caller-supplied skip-urls; convert newlines to pipe-separated
-        # regex alternation that lychee's --exclude flag accepts.
-        SKIP="${{ inputs.skip-urls }}"
-        if [[ -n "$SKIP" ]]; then
-          # Strip blank lines, join with |
-          PATTERNS=$(printf '%s' "$SKIP" | grep -v '^$' | paste -sd '|' -)
-          echo "exclude=--exclude '$PATTERNS'" >> "$GITHUB_OUTPUT"
-        else
-          echo "exclude=" >> "$GITHUB_OUTPUT"
+        # Excludes: join newline-separated patterns into a single
+        # pipe-alternated regex that lychee's --exclude flag accepts.
+        EXCLUDES=""
+        if [[ -n "$SKIP_URLS" ]]; then
+          PATTERNS=$(printf '%s' "$SKIP_URLS" | grep -v '^$' | paste -sd '|' -)
+          EXCLUDES="--exclude '$PATTERNS'"
         fi
+
+        # --root-dir (internal step only): resolves root-relative hrefs to local files.
+        ROOT_DIR=""
+        if [[ -n "$ROOT_DIR_IN" ]]; then
+          ROOT_DIR="--root-dir '$ROOT_DIR_IN'"
+        fi
+
+        # --base-url (internal step only): resolves bare-relative hrefs.
+        BASE_URL=""
+        if [[ -n "$BASE_URL_IN" ]]; then
+          BASE_URL="--base-url '$BASE_URL_IN'"
+        fi
+
+        # --fallback-extensions (internal step only): /about → about.html
+        FALLBACK="--fallback-extensions $FALLBACK_EXT"
+
+        # File-resolution flags are shared by both steps so that root-relative
+        # file:// links can be resolved cleanly, then filtered out by --scheme.
+        # Without this, the external step emits 'Cannot resolve root-relative
+        # link' errors for /_next/* asset paths even though they would have
+        # been filtered by --scheme.
+        COMMON="--no-progress --include-verbatim $FALLBACK $ROOT_DIR $BASE_URL $EXCLUDES $EXTRA_ARGS"
+        INTERNAL="--scheme file $COMMON"
+        EXTERNAL="--scheme https --scheme http $COMMON"
+
+        echo "internal=$INTERNAL" >> "$GITHUB_OUTPUT"
+        echo "external=$EXTERNAL" >> "$GITHUB_OUTPUT"
 
     - name: Run lychee (internal links — blocking)
       id: lychee-internal
       uses: lycheeverse/lychee-action@v2
       with:
-        # Only check internal (same-site) links in this step.
-        # lychee treats relative and root-relative hrefs as internal.
         args: >-
-          --no-progress
-          --include-verbatim
-          --scheme file
-          --base .
-          ${{ steps.excludes.outputs.exclude }}
+          ${{ steps.lychee-args.outputs.internal }}
           ${{ inputs.scan-target }}
         fail: ${{ inputs.fail-on-internal-404 }}
         output: lychee-internal.json
@@ -71,10 +140,7 @@ runs:
       uses: lycheeverse/lychee-action@v2
       with:
         args: >-
-          --no-progress
-          --include-verbatim
-          --scheme https http
-          ${{ steps.excludes.outputs.exclude }}
+          ${{ steps.lychee-args.outputs.external }}
           ${{ inputs.scan-target }}
         fail: "false"
         output: lychee-external.json
