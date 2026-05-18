@@ -105,20 +105,38 @@ runs:
               continue;
             }
 
-            // 2. schema.org context expansion via jsonld processor
-            const type = parsed['@type'] || '(no @type)';
-            const context = parsed['@context'];
+            // 2. Normalize: a block may be a single node, an array of nodes,
+            //    or an object with an @graph array. Validate each node so the
+            //    error message can pin to a specific @type.
+            const nodes = Array.isArray(parsed)
+              ? parsed
+              : Array.isArray(parsed['@graph'])
+                ? parsed['@graph']
+                : [parsed];
 
-            if (!context) {
-              console.warn(`[JSON-LD LINT] ${rel} block[${i}] @type=${type}: missing @context — skipping expansion`);
-              continue;
-            }
+            // Context may live on the root (array or @graph wrapper) or per-node.
+            const rootContext = Array.isArray(parsed) ? null : parsed['@context'];
 
-            try {
-              await jsonld.expand(parsed, { documentLoader: jsonld.documentLoaders.node() });
-            } catch (err) {
-              console.error(`[JSON-LD LINT] ${rel} block[${i}] @type=${type}: expansion failed — ${err.message}`);
-              errors++;
+            for (let n = 0; n < nodes.length; n++) {
+              const node = nodes[n];
+              const type = node && node['@type'] ? node['@type'] : '(no @type)';
+              const context = (node && node['@context']) || rootContext;
+              const label = nodes.length > 1 ? `block[${i}].node[${n}]` : `block[${i}]`;
+
+              if (!context) {
+                console.warn(`[JSON-LD LINT] ${rel} ${label} @type=${type}: missing @context — skipping expansion`);
+                continue;
+              }
+
+              // Inject root context into bare nodes so jsonld.expand can resolve terms.
+              const toExpand = node['@context'] ? node : { '@context': rootContext, ...node };
+
+              try {
+                await jsonld.expand(toExpand, { documentLoader: jsonld.documentLoaders.node() });
+              } catch (err) {
+                console.error(`[JSON-LD LINT] ${rel} ${label} @type=${type}: expansion failed — ${err.message}`);
+                errors++;
+              }
             }
           }
         }
