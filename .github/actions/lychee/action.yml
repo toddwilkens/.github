@@ -24,11 +24,11 @@ inputs:
       and `--scheme file` is used (the default for internal-link checking).
 
       Next.js App Router pattern:
-        root-dir: ${{ github.workspace }}/.next/server/app
+        root-dir: $GITHUB_WORKSPACE/.next/server/app
       Next.js Pages Router pattern:
-        root-dir: ${{ github.workspace }}/.next/server/pages
+        root-dir: $GITHUB_WORKSPACE/.next/server/pages
       Static-export pattern:
-        root-dir: ${{ github.workspace }}/out
+        root-dir: $GITHUB_WORKSPACE/out
     required: false
     default: ""
   fallback-extensions:
