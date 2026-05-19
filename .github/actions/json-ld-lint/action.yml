@@ -39,6 +39,7 @@ runs:
 
     - name: Install jsonld processor
       shell: bash
+      working-directory: /tmp
       run: npm install --no-save jsonld@^9
 
     - name: Write JSON-LD lint script
